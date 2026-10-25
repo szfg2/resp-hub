@@ -349,7 +349,7 @@ body.viewing { overflow: hidden }
 <div class="viewer" id="viewer" hidden role="dialog" aria-modal="true" aria-labelledby="vTitle">
   <div class="v-head">
     <div style="min-width:0"><div class="eyebrow" id="vMeta"></div><h2 id="vTitle"></h2></div>
-    <div class="v-acts"><button class="btn sm" id="vPrint">Print</button><button class="btn sm" id="vDownload">Download</button><button class="btn sm" id="vEmail">Email</button><button class="btn sm primary" id="vClose">Close</button></div>
+    <div class="v-acts"><button class="btn sm" id="vLink">Copy link</button><button class="btn sm" id="vPrint">Print</button><button class="btn sm" id="vDownload">Download</button><button class="btn sm" id="vEmail">Email</button><button class="btn sm primary" id="vClose">Close</button></div>
   </div>
   <div class="v-body" id="vBody"></div>
 </div>
@@ -500,7 +500,20 @@ async function renderPdfPages(blob, body, d) {
     await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
   }
 }
-async function openViewer(d, { print = false } = {}) {
+/* A document's link names its code, so it keeps working when a newer version replaces it. */
+const docLink = d => location.origin + location.pathname + '#' + d.code;
+const latestByCode = code => docs().find(d => d.code === code && !d.archived && d.file) || docs().find(d => d.code === code && d.file);
+let pushedViewer = false;
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch (e) {}
+  const t = document.createElement('textarea'); t.value = text; t.style.cssText = 'position:fixed;opacity:0';
+  document.body.appendChild(t); t.select();
+  let ok = false; try { ok = document.execCommand('copy'); } catch (e) {}
+  t.remove(); return ok;
+}
+
+async function openViewer(d, { print = false, push = true } = {}) {
+  if (push && location.hash !== '#' + d.code) { history.pushState({ doc: d.code }, '', '#' + d.code); pushedViewer = true; }
   viewing = d; viewFrame = null;
   $('#vTitle').textContent = d.title;
   $('#vMeta').textContent = [d.code + (d.ver ? ' v' + d.ver : ''), d.cat, d.file.name].join(' · ');
@@ -539,11 +552,21 @@ function closeViewer() {
   viewing = null; viewFrame = null; $('#viewer').hidden = true; document.body.classList.remove('viewing'); $('#vBody').innerHTML = '';
   if (viewUrl) { URL.revokeObjectURL(viewUrl); viewUrl = null; }
 }
-$('#vClose').onclick = closeViewer;
+$('#vClose').onclick = () => {
+  if (pushedViewer) { history.back(); return; }
+  history.replaceState(null, '', location.pathname); closeViewer();
+};
+window.addEventListener('popstate', () => {
+  if (!DATA) return;
+  const d = latestByCode(location.hash.slice(1));
+  if (d) { pushedViewer = true; if (viewing !== d) openViewer(d, { push: false }); }
+  else { pushedViewer = false; if (viewing) closeViewer(); }
+});
+$('#vLink').onclick = async () => { if (viewing) toast(await copyText(docLink(viewing)) ? 'Link copied. Colleagues need the access code to open it.' : docLink(viewing)); };
 $('#vPrint').onclick = printViewer;
 $('#vDownload').onclick = e => viewing && docAction('download', viewing.id, e.currentTarget);
 $('#vEmail').onclick = e => viewing && docAction('email', viewing.id, e.currentTarget);
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && viewing) closeViewer(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && viewing) $('#vClose').click(); });
 
 async function docAction(act, id, btn) {
   const d = docById(id); if (!d) return;
@@ -557,7 +580,7 @@ async function docAction(act, id, btn) {
       const file = new File([blob], d.file.name, { type: blob.type });
       if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: d.title }); }
       else {
-        const body = `${d.title} (${d.code}${d.ver ? ' v' + d.ver : ''}) is on the Respiratory Hub:\n${location.href.split('#')[0]}\n\nOpen Resources and search "${d.code}".`;
+        const body = `${d.title} (${d.code}${d.ver ? ' v' + d.ver : ''}) is on the Respiratory Hub:\n${docLink(d)}\n\nYou'll need the hub access code to open it.`;
         location.href = `mailto:?subject=${encodeURIComponent(d.title)}&body=${encodeURIComponent(body)}`;
         toast('Opened an email with a link. To send the file itself, download it and attach it.');
       }
@@ -697,6 +720,9 @@ function startApp() {
   $('#homeSugg').innerHTML = $('#askSugg').innerHTML = SUGG.map(s => `<button class="chip" data-ask="${esc(s)}">${esc(s)}</button>`).join('');
   addMsg('a', '<p>Ask for a document by name, who is on call, or when the next meeting is.</p>');
   let start = (location.hash || '').slice(1);
+  const linked = start && !VIEWS.includes(start) ? latestByCode(start) : null;
+  if (linked) { show('resources'); openViewer(linked, { push: false }); return; }
+  if (start && !VIEWS.includes(start) && /^RESP-/.test(start)) { history.replaceState(null, '', location.pathname); toast("That document isn't on the hub any more."); }
   if (!VIEWS.includes(start)) { try { start = localStorage.getItem('hub-view') || 'home' } catch (e) { start = 'home' } }
   show(start);
 }
