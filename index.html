@@ -156,7 +156,16 @@ table.roster { border-collapse: collapse; width: 100%; min-width: 760px; font-si
 .msg.u { align-self: end; background: var(--accent); color: var(--accent-ink); border-bottom-right-radius: 4px }
 .msg.a { align-self: start; background: var(--sunk); border-bottom-left-radius: 4px }
 .msg p { margin: 0 0 8px } .msg p:last-child { margin: 0 }
-.msg ul { margin: 0 0 8px; padding-left: 18px }
+.msg ul, .msg ol { margin: 0 0 8px; padding-left: 20px }
+.msg code { font-family: var(--f-mono); font-size: .9em }
+.msg table.md { border-collapse: collapse; font-size: 13.5px; margin: 0 0 8px }
+.msg table.md td { border: 1px solid var(--line); padding: 4px 8px; vertical-align: top }
+.msg .thinking { margin: 0 }
+.cite { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 4px; margin-left: 2px; border-radius: 9px; border: 0; background: var(--accent-soft); color: var(--accent); font: 600 11px var(--f-mono); vertical-align: 2px; cursor: pointer }
+.sources { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; display: flex; flex-direction: column; gap: 6px }
+.src-row { display: flex; gap: 8px; align-items: flex-start; text-align: left; background: none; border: 0; padding: 4px 0; font-size: 13px; color: inherit }
+.src-row:hover b { color: var(--accent); text-decoration: underline }
+.src-row .cite { flex: none; margin: 1px 0 0 }
 .hit { display: flex; justify-content: space-between; gap: 8px; align-items: center; flex-wrap: wrap; padding: 6px 0; border-top: 1px solid var(--line) }
 .compose { border-top: 1px solid var(--line); padding: 12px; display: flex; flex-direction: column; gap: 10px }
 .compose form { display: flex; gap: 8px }
@@ -324,13 +333,13 @@ body.viewing { overflow: hidden }
     </section>
 
     <section id="v-ask" data-v hidden>
-      <div class="head"><div><div class="eyebrow">Preview · keyword search over the hub</div><h1>Ask the Hub</h1></div></div>
+      <div class="head"><div><div class="eyebrow" id="askEyebrow">Preview · keyword search over the hub</div><h1>Ask the Hub</h1></div><button class="btn sm" id="newChat" hidden>New conversation</button></div>
       <div class="panel chat">
         <div class="msgs" id="msgs"></div>
         <div class="compose">
           <div class="sugg" id="askSugg"></div>
           <form id="askForm"><input id="askInput" placeholder="Ask about a document, the roster or an event" aria-label="Your question"><button class="btn primary">Send</button></form>
-          <div class="scope">This preview matches keywords. The full version would use Claude to read inside every document and answer with citations. Do not enter patient identifiers.</div>
+          <div class="scope" id="askScope">This preview matches keywords. The full version would use Claude to read inside every document and answer with citations. Do not enter patient identifiers.</div>
         </div>
       </div>
     </section>
@@ -512,7 +521,7 @@ async function copyText(text) {
   t.remove(); return ok;
 }
 
-async function openViewer(d, { print = false, push = true } = {}) {
+async function openViewer(d, { print = false, push = true, page = null } = {}) {
   if (push && location.hash !== '#' + d.code) { history.pushState({ doc: d.code }, '', '#' + d.code); pushedViewer = true; }
   viewing = d; viewFrame = null;
   $('#vTitle').textContent = d.title;
@@ -526,7 +535,7 @@ async function openViewer(d, { print = false, push = true } = {}) {
     viewUrl = URL.createObjectURL(blob);
     if (kind === 'pdf' && navigator.pdfViewerEnabled) {
       body.innerHTML = '';
-      viewFrame = document.createElement('iframe'); viewFrame.title = d.title; viewFrame.src = viewUrl;
+      viewFrame = document.createElement('iframe'); viewFrame.title = d.title; viewFrame.src = viewUrl + (page ? '#page=' + page : '');
       if (print) viewFrame.onload = () => setTimeout(printViewer, 300);
       body.appendChild(viewFrame); return;
     }
@@ -694,9 +703,197 @@ function answer(text) {
   return `<p>I couldn't match that to a document, roster entry or event. Try a document name (e.g. "NIV"), "who is on call tomorrow", or "next journal club".</p>`;
 }
 function addMsg(who, html) { const m = document.createElement('div'); m.className = 'msg ' + who; m.innerHTML = html; $('#msgs').appendChild(m); $('#msgs').scrollTop = $('#msgs').scrollHeight; }
-function ask(text) { show('ask'); addMsg('u', `<p>${esc(text)}</p>`); setTimeout(() => addMsg('a', answer(text)), 200); }
+function ask(text) {
+  show('ask');
+  if (DATA.ai) { askClaude(text); return; }
+  addMsg('u', `<p>${esc(text)}</p>`); setTimeout(() => addMsg('a', answer(text)), 200);
+}
+
+/* ---------- Ask the Hub with Claude ----------
+   The page searches the hub's document text itself (BM25 over ~1,500-character passages), then sends Claude
+   only the best passages plus this week's roster and upcoming events, as citable documents. */
+const STOP_EN = new Set('a about above after again all also am an and any are as at be because been before being below between both but by can could did do does doing down during each few for from further had has have having he her here hers him his how i if in into is it its just me more most my no nor not now of off on once only or other our out over own same she should so some such than that the their them then there these they this those through to too under until up very was we were what when where which while who whom why will with would you your'.split(' '));
+const tokens = s => s.toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 1 && !STOP_EN.has(w)).map(w => w.length > 4 && w.endsWith('s') ? w.slice(0, -1) : w);
+let CORPUS = null;
+async function loadCorpus() {
+  if (CORPUS) return CORPUS;
+  const res = await fetch('data/search.enc', { cache: 'no-store' });
+  if (!res.ok) throw new Error('search data');
+  const docsText = JSON.parse(new TextDecoder().decode(await decryptBuf(KEY, await res.arrayBuffer())));
+  const chunks = [];
+  for (const d of docsText) {
+    const parts = d.text.split(/\[Page (\d+)\]/);
+    const segments = parts.length > 1 ? parts.slice(1).reduce((a, v, i) => (i % 2 ? a[a.length - 1].text = v : a.push({ page: +v }), a), []) : [{ page: null, text: d.text }];
+    for (const seg of segments) {
+      let buf = [];
+      const flush = () => { const t = buf.join('\n').trim(); if (t.length > 40) chunks.push({ id: chunks.length, doc: d, page: seg.page, text: t }); buf = []; };
+      for (const line of (seg.text || '').split('\n')) { buf.push(line); if (buf.join('\n').length > 1500) flush(); }
+      flush();
+    }
+  }
+  const df = new Map();
+  for (const c of chunks) {
+    c.tf = new Map();
+    const ts = tokens(c.doc.title + ' ' + c.text); c.len = ts.length;
+    ts.forEach(t => c.tf.set(t, (c.tf.get(t) || 0) + 1));
+    c.tf.forEach((_, t) => df.set(t, (df.get(t) || 0) + 1));
+  }
+  const avg = chunks.reduce((s, c) => s + c.len, 0) / Math.max(chunks.length, 1);
+  return CORPUS = { chunks, df, avg };
+}
+function search(query, k = 8) {
+  const { chunks, df, avg } = CORPUS, N = chunks.length, qs = [...new Set(tokens(query))];
+  return chunks.map(c => {
+    let s = 0;
+    for (const t of qs) {
+      const f = c.tf.get(t); if (!f) continue;
+      const idf = Math.log(1 + (N - df.get(t) + 0.5) / (df.get(t) + 0.5));
+      s += idf * f * 2.2 / (f + 1.2 * (0.25 + 0.75 * c.len / avg));
+    }
+    return [s, c];
+  }).filter(([s]) => s > 0).sort((a, b) => b[0] - a[0]).slice(0, k).map(([, c]) => c);
+}
+function contextDoc() {
+  const lines = [`Today is ${TODAY.toLocaleDateString('en-SG', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })} (Singapore).`, '',
+    `ROSTER: ${R().title || 'none published'}${R().sample ? ' (SAMPLE DATA, made up)' : ''}`];
+  for (let k = 0; k < 7; k++) {
+    const d = addDays(TODAY, k), day = rosterDay(d).filter(([, n]) => n !== '—');
+    if (day.length) lines.push(`${fmtShort(d)}: ` + day.map(([r, n]) => `${r}: ${n}${ext(n) ? ' (ext ' + ext(n) + ')' : ''}`).join('; '));
+  }
+  lines.push('', 'DEPARTMENT EVENTS, next 30 days:');
+  for (let k = 0; k < 30; k++) {
+    const d = addDays(TODAY, k);
+    eventsOn(d).forEach(e => lines.push(`${fmtShort(d)} ${e.time || 'all day'}: ${e.title}${e.where ? ', ' + e.where : ''}${e.sample ? ' (sample)' : ''}`));
+  }
+  lines.push('', 'DOCUMENTS ON THE HUB: ' + docs().filter(d => !d.archived).map(d => `${d.title} (${d.code}${d.ver ? ' v' + d.ver : ''}${d.sample ? ', sample entry with no file' : ''})`).join('; '));
+  return lines.join('\n');
+}
+const SYSTEM = `You are Ask the Hub, the assistant on the internal hub of a Respiratory and Critical Care Medicine department in Singapore. The people asking are doctors (MOs, registrars, consultants), nurses and allied health staff.
+
+Answer from the documents provided in this conversation: department protocols, guidelines, forms and teaching material, plus a roster and calendar summary. Cite the passage you rely on for every clinical statement, dose, threshold or step.
+If the provided material doesn't answer the question, say so plainly and name the document or person most likely to help. Do not fill gaps from general knowledge for doses, thresholds, contraindications or protocol steps. Brief general context is acceptable only when you label it clearly as not from the hub's documents.
+Use specialist clinical language; standard abbreviations need no explanation. Lead with the answer, then the key numbers or steps. Keep it short; use bullet lists when they help.
+Entries marked sample are made-up placeholders: say so if you rely on one.
+Never ask for, repeat or store patient-identifiable information. If a question contains it, ask the user to remove it.`;
+
+let anthropicClient = null, convo = [], sentChunks = new Set(), activeStream = null;
+async function claudeClient() {
+  if (anthropicClient) return anthropicClient;
+  const { default: Anthropic } = await import('./vendor/anthropic-sdk.js');
+  anthropicClient = new Anthropic({ apiKey: DATA.ai.key, dangerouslyAllowBrowser: true, maxRetries: 2 });
+  anthropicClient.E = Anthropic;
+  return anthropicClient;
+}
+function usageToday() {
+  const k = 'hub-ask-' + iso(TODAY);
+  try { return [k, +(localStorage.getItem(k) || 0)]; } catch (e) { return [k, 0]; }
+}
+function inlineMd(s) {
+  return esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, '$1<i>$2</i>').replace(/`([^`]+)`/g, '<code>$1</code>');
+}
+function md(src) {
+  let html = '', list = null, table = null;
+  const close = () => { if (list) { html += `</${list}>`; list = null; } if (table) { html += '</table></div>'; table = null; } };
+  for (const raw of src.split('\n')) {
+    const l = raw.trimEnd(); let m;
+    if (/^\s*\|.*\|\s*$/.test(l)) {
+      if (/^\s*\|[\s:|-]+\|\s*$/.test(l)) continue;
+      if (!table) { close(); html += '<div class="scroller"><table class="md">'; table = true; }
+      html += '<tr>' + l.trim().slice(1, -1).split('|').map(c => `<td>${inlineMd(c.trim())}</td>`).join('') + '</tr>';
+    } else if ((m = l.match(/^\s*[-*•]\s+(.*)/))) { if (list !== 'ul') { close(); html += '<ul>'; list = 'ul'; } html += `<li>${inlineMd(m[1])}</li>`; }
+    else if ((m = l.match(/^\s*\d+[.)]\s+(.*)/))) { if (list !== 'ol') { close(); html += '<ol>'; list = 'ol'; } html += `<li>${inlineMd(m[1])}</li>`; }
+    else if ((m = l.match(/^#{1,4}\s+(.*)/))) { close(); html += `<p><b>${inlineMd(m[1])}</b></p>`; }
+    else if (!l.trim()) close();
+    else { close(); html += `<p>${inlineMd(l)}</p>`; }
+  }
+  close(); return html;
+}
+function renderAnswer(el, content, refs) {
+  const used = [];
+  let text = '';
+  for (const b of content) {
+    if (b.type !== 'text') continue;
+    text += b.text;
+    for (const c of b.citations || []) {
+      const ref = refs[c.document_index]; if (!ref) continue;
+      let n = used.findIndex(u => u.ref === ref) + 1;
+      if (!n) { used.push({ ref, quote: c.cited_text }); n = used.length; }
+      text += `⟦${n}⟧`;
+    }
+  }
+  let html = md(text).replace(/(⟦\d+⟧)+/g, run => [...new Set(run.match(/\d+/g))].map(n => `<button class="cite" data-src="${n - 1}">${n}</button>`).join(''));
+  if (used.length) html += `<div class="sources"><div class="eyebrow">Sources</div>${used.map((u, i) => `<button class="src-row" data-src="${i}"><span class="cite">${i + 1}</span><span><b>${esc(u.ref.label)}</b><br><span class="muted">“${esc(u.quote.trim().slice(0, 160))}${u.quote.length > 160 ? '…' : ''}”</span></span></button>`).join('')}</div>`;
+  el.innerHTML = html || '<p class="muted">No answer text was returned.</p>';
+  el.querySelectorAll('[data-src]').forEach(b => b.onclick = () => openRef(used[+b.dataset.src].ref));
+}
+function openRef(ref) {
+  if (!ref.docId) { show('rosters'); return; }
+  const d = docById(ref.docId); if (d) openViewer(d, { page: ref.page });
+}
+function friendlyError(err, E) {
+  if (E && err instanceof E.AuthenticationError) return "The hub's Claude key isn't valid any more. Tell the hub admin.";
+  if (E && err instanceof E.PermissionDeniedError) return "The hub's Claude key isn't allowed to use this model. Tell the hub admin.";
+  if (E && err instanceof E.RateLimitError) return 'Claude is busy right now. Wait a minute and try again.';
+  if (E && err instanceof E.BadRequestError) return /credit|billing|spend|limit/i.test(err.message) ? "The hub's Claude budget for this month is used up. Tell the hub admin." : 'Claude rejected the request: ' + err.message;
+  if (E && err instanceof E.APIConnectionError) return "Couldn't reach Claude from this network. Check your connection or try another network.";
+  if (E && err instanceof E.APIError) return 'Claude returned an error (' + (err.status || '?') + '). Try again shortly.';
+  return 'Something went wrong: ' + (err.message || err);
+}
+async function askClaude(text) {
+  if (activeStream) return;
+  if (/\b[STFGM]\d{7}[A-Z]\b/i.test(text)) { addMsg('a', '<p>That looks like an NRIC or FIN. Remove patient identifiers and ask again.</p>'); return; }
+  const [ukey, used] = usageToday();
+  if (used >= (DATA.ai.daily_limit || 40)) { addMsg('a', `<p>You've reached today's limit of ${DATA.ai.daily_limit || 40} questions on this device.</p>`); return; }
+  addMsg('u', `<p>${esc(text)}</p>`);
+  const out = document.createElement('div'); out.className = 'msg a'; out.innerHTML = '<p class="muted thinking">Searching the hub…</p>';
+  $('#msgs').appendChild(out); $('#msgs').scrollTop = $('#msgs').scrollHeight;
+  setAsking(true);
+  let client;
+  try {
+    client = await claudeClient();
+    await loadCorpus();
+    const prior = convo.filter(m => m.role === 'user').slice(-2).map(m => m.question).join(' ');
+    const hits = search(text + ' ' + prior).filter(c => !sentChunks.has(c.id));
+    const blocks = [], refs = [];
+    if (!convo.length) { blocks.push({ type: 'document', source: { type: 'text', media_type: 'text/plain', data: contextDoc() }, title: 'Roster and calendar summary', citations: { enabled: true } }); refs.push({ docId: null, label: 'Roster and calendar' }); }
+    for (const c of hits) {
+      const label = `${c.doc.title} (${c.doc.code}${c.doc.ver ? ' v' + c.doc.ver : ''})${c.page ? ', page ' + c.page : ''}`;
+      blocks.push({ type: 'document', source: { type: 'text', media_type: 'text/plain', data: c.text }, title: label, citations: { enabled: true } });
+      refs.push({ docId: c.doc.id, page: c.page, label }); sentChunks.add(c.id);
+    }
+    blocks.push({ type: 'text', text });
+    convo.push({ role: 'user', content: blocks, refs, question: text, chunkIds: hits.map(c => c.id) });
+    const allRefs = convo.flatMap(m => m.refs || []);
+    out.innerHTML = '<p class="muted thinking">Thinking…</p>';
+    activeStream = client.messages.stream({
+      model: DATA.ai.model, max_tokens: 16000,
+      thinking: { type: 'adaptive' }, output_config: { effort: DATA.ai.effort || 'medium' },
+      cache_control: { type: 'ephemeral' },
+      system: SYSTEM,
+      messages: convo.map(m => ({ role: m.role, content: m.content })),
+    });
+    let live = '';
+    activeStream.on('text', t => { live += t; out.innerHTML = md(live); $('#msgs').scrollTop = $('#msgs').scrollHeight; });
+    const msg = await activeStream.finalMessage();
+    try { localStorage.setItem(ukey, used + 1) } catch (e) {}
+    if (msg.stop_reason === 'refusal') { out.innerHTML = '<p>Claude declined to answer this question.</p>'; dropLastQuestion(); return; }
+    renderAnswer(out, msg.content, allRefs);
+    if (msg.stop_reason === 'max_tokens') out.insertAdjacentHTML('beforeend', '<p class="muted">The answer was cut short. Ask a narrower question.</p>');
+    convo.push({ role: 'assistant', content: msg.content.filter(b => b.type === 'text').map(b => b.text).join('') || '(no answer)' });
+  } catch (err) {
+    dropLastQuestion();
+    out.innerHTML = err?.name === 'APIUserAbortError' || /abort/i.test(err?.message || '') ? '<p class="muted">Stopped.</p>' : `<p>${esc(friendlyError(err, client?.E))}</p>`;
+  } finally { activeStream = null; setAsking(false); $('#msgs').scrollTop = $('#msgs').scrollHeight; }
+}
+function dropLastQuestion() {
+  if (convo.length && convo[convo.length - 1].role === 'user') (convo.pop().chunkIds || []).forEach(id => sentChunks.delete(id));
+}
+function setAsking(on) {
+  const b = $('#askForm button'); b.textContent = on ? 'Stop' : 'Send'; b.classList.toggle('primary', !on);
+}
+function newChat() { if (activeStream) activeStream.abort(); convo = []; sentChunks = new Set(); $('#msgs').innerHTML = ''; addMsg('a', '<p>New conversation. Ask about a protocol, the roster or an upcoming event.</p>'); }
 const SUGG = ['Who is on call today?', 'Next ILD MDT', 'EBUS booking'];
-$('#askForm').addEventListener('submit', e => { e.preventDefault(); const v = $('#askInput').value.trim(); if (v) { ask(v); $('#askInput').value = ''; } });
+$('#askForm').addEventListener('submit', e => { e.preventDefault(); if (activeStream) { activeStream.abort(); return; } const v = $('#askInput').value.trim(); if (v) { ask(v); $('#askInput').value = ''; } });
 $('#homeAsk').addEventListener('submit', e => { e.preventDefault(); const v = $('#homeAskInput').value.trim(); if (v) { ask(v); $('#homeAskInput').value = ''; } });
 
 /* ---------- Upload requests ---------- */
@@ -718,7 +915,12 @@ function startApp() {
   try { $('#findName').value = localStorage.getItem('hub-find') || '' } catch (e) {}
   renderHome(); renderDocs(); renderRoster(); renderCal(); renderInbox();
   $('#homeSugg').innerHTML = $('#askSugg').innerHTML = SUGG.map(s => `<button class="chip" data-ask="${esc(s)}">${esc(s)}</button>`).join('');
-  addMsg('a', '<p>Ask for a document by name, who is on call, or when the next meeting is.</p>');
+  if (DATA.ai) {
+    $('#askEyebrow').textContent = "Claude · answers cite the hub's documents";
+    $('#askScope').textContent = "Answers come from the hub's documents, roster and calendar, with sources. Check the source before acting on it. Do not enter patient identifiers.";
+    $('#newChat').hidden = false; $('#newChat').onclick = newChat;
+    addMsg('a', "<p>Ask about a protocol, a form, the roster or an upcoming event. I answer from the hub's documents and show where each answer comes from.</p>");
+  } else addMsg('a', '<p>Ask for a document by name, who is on call, or when the next meeting is.</p>');
   let start = (location.hash || '').slice(1);
   const linked = start && !VIEWS.includes(start) ? latestByCode(start) : null;
   if (linked) { show('resources'); openViewer(linked, { push: false }); return; }
