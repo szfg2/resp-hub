@@ -579,7 +579,7 @@ function renderInbox() {
   $('#pendingCount').hidden = !pending; $('#pendingCount').textContent = pending;
   $('#mailList').innerHTML = log.length ? log.map(m => `<div class="mail"><div style="min-width:0;display:flex;flex-direction:column;gap:2px">
     <span class="from">${esc(m.from || '')} · ${esc(m.received || '')}</span><span class="subj">${esc(m.subject || '(no subject)')}</span></div>
-    <span class="status st-${esc(m.status)}">${esc({ pending: 'Awaiting approval', published: 'Published', rejected: 'Rejected', blocked: 'Blocked' }[m.status] || m.status)}</span>
+    <span class="status st-${esc(m.status)}">${esc({ pending: 'Awaiting approval in Telegram',published: 'Published', rejected: 'Rejected', blocked: 'Blocked' }[m.status] || m.status)}</span>
     ${m.items?.length ? `<ul>${m.items.map(i => `<li>${esc(i)}</li>`).join('')}</ul>` : ''}</div>`).join('') : '<div class="body empty">No upload emails yet.</div>';
 }
 $('#copyAddr').onclick = () => {
